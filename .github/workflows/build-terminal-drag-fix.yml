@@ -1,0 +1,83 @@
+name: Build terminal drag fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit containing the terminal drag fix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: target/production
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.source_ref }}
+      - name: Select x64 MSVC and Windows SDK
+        run: ./tools/use-windows-toolchain.ps1 -GitHubActions
+      - name: Install pinned Rust and Windows target
+        run: |
+          $toolchain = Get-Content rust-toolchain.toml -Raw
+          $channel = [regex]::Match($toolchain, 'channel\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $channel) { throw 'Missing pinned Rust version.' }
+          rustup toolchain install $channel --profile minimal --component rustfmt --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust toolchain installation failed.' }
+          rustc -vV
+          cargo -V
+      - name: Fetch locked Windows dependencies
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
+      - name: Build release binaries
+        run: cargo build --release --locked --offline --no-default-features --target-dir target/production -p luciddesk -p luciddesk-explorer -p luciddesk-cli
+      - name: Assemble ordinary ZIP
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'LucidDesk-0.25.3-terminal-drag-fix-windows-x64'
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          foreach ($name in @('luciddesk.exe', 'luciddesk_explorer.dll', 'luciddesk-cli.exe')) {
+            Copy-Item -LiteralPath (Join-Path 'target/production/release' $name) -Destination $stage
+          }
+          $agentFiles = & ./tools/packaging/stage-agent-payload.ps1 -SourceRoot $PWD -Destination $stage
+          Copy-Item -LiteralPath 'tools/assets/Refresh-App-Icon.ps1' -Destination $stage
+          Copy-Item -LiteralPath 'docs/package.md' -Destination (Join-Path $stage 'README.md')
+          foreach ($manual in @('usage.md', 'usage.en.md')) {
+            $text = Get-Content -LiteralPath (Join-Path 'docs' $manual) -Raw
+            $text.Replace('(../CHANGELOG', '(CHANGELOG') | Set-Content -LiteralPath (Join-Path $stage $manual) -Encoding utf8
+          }
+          foreach ($document in @('brand.md', 'installer.md', 'portable.md')) {
+            Copy-Item -LiteralPath (Join-Path 'docs' $document) -Destination $stage
+          }
+          foreach ($document in @('LICENSE', 'PRIVACY.md', 'PRIVACY.en.md', 'CHANGELOG.md', 'CHANGELOG.en.md')) {
+            Copy-Item -LiteralPath $document -Destination $stage
+          }
+          $files = @('luciddesk.exe', 'luciddesk_explorer.dll', 'luciddesk-cli.exe') | ForEach-Object {
+            [ordered]@{ file = $_; sha256 = (Get-FileHash -LiteralPath (Join-Path $stage $_) -Algorithm SHA256).Hash.ToLowerInvariant() }
+          }
+          [ordered]@{
+            version = '0.25.3'; channel = 'release'; revision = (git rev-parse HEAD)
+            uncommittedChanges = $false; portable = $false; plugins = @(); systemMonitorPlugin = $false
+            renderingDiagnostics = $false; builtAt = (Get-Date).ToUniversalTime().ToString('o')
+            architecture = 'windows-x64'
+            buildEnvironment = [ordered]@{
+              rustc = ((rustc -vV) -join "`n"); cargo = (cargo -V)
+              runnerImage = $env:ImageOS; runnerVersion = $env:ImageVersion
+              windows = ($env:LUCIDDESK_WINDOWS_BUILD_ENVIRONMENT | ConvertFrom-Json)
+            }
+            files = @($files) + @($agentFiles)
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding utf8
+          Compress-Archive -LiteralPath $stage -DestinationPath 'LucidDesk-0.25.3-terminal-drag-fix-windows-x64.zip' -CompressionLevel Optimal
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: LucidDesk-0.25.3-terminal-drag-fix-windows-x64
+          path: LucidDesk-0.25.3-terminal-drag-fix-windows-x64.zip
+          if-no-files-found: error
